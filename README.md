@@ -21,6 +21,295 @@ It's an experiment in trading deterministic integration code for readable intent
 3. The LLM decides which **skills** to call — Lua scripts that can hit webhooks, write files, translate formats, send emails, or anything else you wire up.
 4. The agent loops until the work is done (up to 20 tool rounds), then returns a final response.
 
+## Examples
+
+### HL7 ADT router — parse, validate, and forward
+
+An MLLP listener that receives HL7 v2 ADT messages, parses them using the LLM, validates clinical safety rules, and POSTs structured JSON to a downstream webhook. The soul file defines the routing rules in plain English — which message types go where, what validation to apply, and what to do with edge cases.
+
+```
+my-project/
+├── config.lua
+├── souls/
+│   └── router.md
+└── skills/
+    ├── webhook.lua
+    └── notice.lua
+```
+
+**config.lua**
+```lua
+channel("adt_router", {
+    source = mllp({ port = 2575 }),
+    soul = "souls/router.md",
+    skills = { "skills/webhook.lua", "skills/notice.lua" }
+})
+```
+
+**souls/router.md**
+```markdown
+You are a clinical integration engine for ADT messages.
+
+## Routing Rules
+
+- ADT^A04 (Registration): POST to https://ehr.internal/api/patients
+- ADT^A01 (Admission): POST to https://ehr.internal/api/admissions
+  - Must contain PV1 segment. If missing, still forward but set "warning": true
+- ADT^A03 (Discharge): POST to https://ehr.internal/api/discharges
+  - Include "disposition": "discharge" in payload
+
+## Validation
+
+PID-3 (Patient Identifier) is required for all patient messages.
+Never route a message without a verified patient identifier.
+If a message can't be parsed, log a notice — don't guess at field values.
+```
+
+**skills/webhook.lua**
+```lua
+return {
+  name = "webhook",
+  description = "POST JSON to an external URL",
+  params = {
+    url  = { type = "string", required = true, doc = "Destination URL" },
+    body = { type = "string", required = true, doc = "JSON payload" }
+  },
+  run = function(params)
+    local resp = http.post(params.url, {
+      headers = { ["Content-Type"] = "application/json" },
+      body = params.body
+    })
+    return { status = "ok", http_status = resp.status }
+  end
+}
+```
+
+The LLM reads the raw HL7, understands the routing rules from the soul, extracts and validates the fields, builds the JSON payload, and calls the webhook skill. No HL7 parsing library needed.
+
+---
+
+### Email agent — receive, reply, and continue the conversation
+
+An IMAP channel that monitors a mailbox, lets an LLM agent respond to emails, and automatically threads replies back into the same conversation. When someone replies to the agent's email, it picks up where it left off.
+
+```
+my-project/
+├── config.lua
+├── souls/
+│   └── support.md
+└── skills/
+    └── reply_email.lua
+```
+
+**config.lua**
+```lua
+smtp({
+    host = "smtp.gmail.com",
+    port = 587,
+    username = env("EMAIL_USER"),
+    password = env("EMAIL_PASS"),
+    from = env("EMAIL_USER"),
+    allowed_recipients = { env("EMAIL_USER") }
+})
+
+channel("support", {
+    source = imap({
+        host = "imap.gmail.com",
+        port = 993,
+        username = env("EMAIL_USER"),
+        password = env("EMAIL_PASS"),
+        mailbox = "INBOX",
+        poll_interval = 30,
+        mark_read = true,
+        ssl = true,
+        search = 'UNSEEN SUBJECT "[support]"',
+    }),
+    soul = "souls/support.md",
+    skills = { "skills/reply_email.lua" }
+})
+```
+
+**souls/support.md**
+```markdown
+You are a support agent for Acme Corp.
+
+When you receive an email, read it carefully and reply with a helpful answer.
+If you don't know the answer, say so honestly and offer to escalate.
+Keep replies concise and professional.
+```
+
+**skills/reply_email.lua**
+```lua
+return {
+  name = "reply_email",
+  description = "Send an email reply to the sender",
+  params = {
+    to      = { type = "string", required = true, doc = "Recipient email" },
+    subject = { type = "string", required = true, doc = "Subject line" },
+    body    = { type = "string", required = true, doc = "Plain text body" }
+  },
+  run = function(params)
+    return email.send({
+      to = params.to,
+      subject = params.subject,
+      body = params.body
+    })
+  end
+}
+```
+
+**What happens:**
+
+1. Someone sends an email with `[support]` in the subject
+2. IMAP source picks it up, creates a new thread, feeds it to the agent
+3. Agent reads the email, decides to reply, calls `reply_email`
+4. The outgoing email gets a `Message-ID` linked to the thread
+5. When the person replies, the `In-Reply-To` header matches — the reply is routed back to the same channel and thread
+6. The agent sees the full conversation history and continues naturally
+
+No webhook glue, no external thread tracker. Email threading is built in.
+
+---
+
+### HTTP API with multi-step agent logic
+
+An HTTP endpoint that receives data, runs it through multiple tools, and returns a JSON response. The agent decides which tools to call and in what order.
+
+**config.lua**
+```lua
+channel("lab_api", {
+    source = http({ port = 4000, path = "/lab" }),
+    soul = "souls/lab_processor.md",
+    skills = {
+        "skills/translate_to_fhir.lua",
+        "skills/webhook.lua",
+        "skills/write_log.lua"
+    }
+})
+```
+
+**souls/lab_processor.md**
+```markdown
+You process lab results (ORU^R01 messages).
+
+For each message:
+1. Translate to FHIR R4 format using translate_to_fhir
+2. POST the FHIR bundle to https://fhir.internal/Bundle
+3. Log the processing result
+
+If any step fails, log the error and continue with remaining steps.
+```
+
+POST an HL7 message to `http://localhost:4000/lab` and the agent translates, forwards, logs, and returns a summary — all decided by the LLM based on the soul.
+
+---
+
+### File watcher with email alerts
+
+Watch a directory for new files, process them, and email someone if something looks wrong.
+
+**config.lua**
+```lua
+smtp({
+    host = "smtp.gmail.com",
+    port = 587,
+    username = env("EMAIL_USER"),
+    password = env("EMAIL_PASS"),
+    from = env("EMAIL_USER"),
+    allowed_recipients = { "oncall@hospital.org" }
+})
+
+channel("lab_inbox", {
+    source = file_watcher({ dir = "./hl7_drop", pattern = "*.hl7" }),
+    soul = "souls/lab_watcher.md",
+    skills = { "skills/webhook.lua", "builtin:email" }
+})
+```
+
+**souls/lab_watcher.md**
+```markdown
+You monitor incoming HL7 lab result files.
+
+For each file:
+1. Parse the HL7 message and extract patient name, test type, and result values
+2. POST structured JSON to https://ehr.internal/api/results
+3. If any OBX segment has an abnormal flag (H, HH, L, LL, A), email oncall@hospital.org
+   with the patient name, test, and abnormal values
+
+Files are automatically archived after processing.
+```
+
+Files dropped into `./hl7_drop/` get staged to `processing/`, run through the agent, and archived to `archive/YYYY/MM/DD/`. The agent only emails on abnormal results — that logic lives in the soul, not in code.
+
+---
+
+### Cron polling — pull data on a schedule
+
+Poll an external API and feed results into a channel for processing.
+
+**config.lua**
+```lua
+channel("results_processor", {
+    source = http({ port = 4001, path = "/internal" }),
+    soul = "souls/processor.md",
+    skills = { "skills/webhook.lua", "skills/write_log.lua" }
+})
+
+cron("lab_poller", {
+    interval = 60,
+    script = "skills/poll_lab.lua",
+    channel = "results_processor"
+})
+```
+
+**skills/poll_lab.lua**
+```lua
+return {
+    run = function()
+        local resp = http.get("https://api.lab.com/results?status=new")
+        if resp.status == 200 and resp.body ~= "[]" then
+            return resp.body   -- forwarded to channel as a message
+        end
+        return nil             -- nothing new, skip this cycle
+    end
+}
+```
+
+Every 60 seconds, the cron script checks for new results. If there are any, the data is sent to `results_processor` as if it arrived via HTTP — same soul, same skills, same agent loop.
+
+---
+
+### Sub-agent composition — delegate to specialists
+
+A skill can itself be an agent. Give it a `soul` and `skills` instead of a `run` function, and it spawns a nested agent loop. This lets a top-level router delegate to specialist sub-agents.
+
+**config.lua**
+```lua
+channel("triage", {
+    source = http({ port = 4000, path = "/messages" }),
+    soul = "souls/triage.md",
+    skills = {
+        "skills/lab_agent.lua",
+        "skills/billing_agent.lua",
+        "builtin:log"
+    }
+})
+```
+
+**skills/lab_agent.lua**
+```lua
+return {
+  name = "lab_agent",
+  description = "Specialist agent for processing lab/pathology messages",
+  soul = "souls/lab_specialist.md",
+  skills = { "skills/translate_to_fhir.lua", "skills/webhook.lua" }
+}
+```
+
+The triage agent decides which specialist to hand off to. The lab agent gets its own soul, its own tools, and runs a full agent loop — then returns the result to the parent. Agents all the way down.
+
+---
+
 ## Configuration
 
 Everything is defined in `config.lua`:
