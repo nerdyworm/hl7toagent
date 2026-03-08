@@ -1,0 +1,45 @@
+---@meta
+
+--- Parameter definition for a skill.
+---@class ParamDef
+---@field type? "string"|"number"|"integer"|"boolean" Parameter type (default: "string").
+---@field required? boolean Whether the parameter is required (default: false).
+---@field doc? string Description of the parameter shown to the LLM.
+
+--- Skill definition table. Return this from your skill `.lua` file.
+---
+--- ## Tool skill (has `run`)
+--- ```lua
+--- return {
+---     name = "webhook",
+---     description = "Sends a webhook POST request",
+---     params = {
+---         url = { type = "string", required = true, doc = "Destination URL" },
+---         body = { type = "string", required = true, doc = "JSON body" },
+---     },
+---     run = function(params)
+---         local resp = http.post(params.url, { body = params.body })
+---         return { status = "ok", http_status = resp.status }
+---     end
+--- }
+--- ```
+---
+--- ## Agent skill (has `soul` + `skills`, no `run`)
+--- ```lua
+--- return {
+---     name = "researcher",
+---     description = "A sub-agent that researches a topic",
+---     soul = "souls/researcher.md",
+---     skills = { "skills/web_search.lua", "skills/summarize.lua" },
+---     params = {
+---         query = { type = "string", required = true, doc = "What to research" },
+---     },
+--- }
+--- ```
+---@class Skill
+---@field name string Unique name for this skill (used as the LLM tool name).
+---@field description string What this skill does (shown to the LLM).
+---@field params? table<string, ParamDef> Parameter definitions. If omitted, defaults to a single `message` string param.
+---@field run? fun(params: table<string, any>): table Function that executes the skill. Receives params, returns a result table. Required for tool skills.
+---@field soul? string Path to a soul `.md` file (system prompt). If set, this skill becomes a sub-agent.
+---@field skills? string[] Paths to sub-skill files. Used with `soul` for agent skills.
