@@ -32,7 +32,9 @@ hl7toagent-*.tar
 /sandbox/
 /archive/
 /processing/
-threads.db
+*.db
+*.db-shm
+*.db-wal
 
 # Burrito build output
 /burrito_out/
