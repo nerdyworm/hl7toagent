@@ -164,9 +164,9 @@ defmodule Hl7toagent.Channel.Skill do
       {:ok, result, lua} ->
         decoded =
           case result do
-            [{:tref, _} = tref] -> deep_decode(lua, tref)
-            [val] when is_list(val) -> Lua.Table.deep_cast(val)
-            [val] -> val
+            [{:tref, _} = tref | _] -> deep_decode(lua, tref)
+            [val | _] when is_list(val) -> Lua.Table.deep_cast(val)
+            [val | _] -> val
             [] -> nil
           end
 

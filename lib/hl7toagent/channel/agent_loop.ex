@@ -46,9 +46,7 @@ defmodule Hl7toagent.Channel.AgentLoop do
         if tool_calls == [] do
           text = ReqLLM.Response.text(response)
 
-          Logger.info(
-            "[#{label}] Final response (round #{round}): #{String.slice(text || "", 0..200)}"
-          )
+          Logger.info("[#{label}] Final response (round #{round}):\n#{text}")
 
           {:ok, text, response.context}
         else

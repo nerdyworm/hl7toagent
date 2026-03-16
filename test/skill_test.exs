@@ -282,6 +282,25 @@ defmodule Hl7toagent.Channel.SkillTest do
       assert result["error"] =~ "no_run.lua"
     end
 
+    test "run returning multiple values (nil + error string) does not crash", %{tmp_dir: dir} do
+      Application.put_env(:hl7toagent, :project_dir, dir)
+
+      path = write_skill(dir, "multi_return.lua", """
+      return {
+        name = "multi_return",
+        description = "returns nil plus error string like file.read does",
+        run = function(params)
+          return nil, "enoent"
+        end
+      }
+      """)
+
+      {:ok, json} = Skill.execute(path, %{message: "test"})
+      result = Jason.decode!(json)
+      # First return value is nil, so we get empty map
+      assert result == %{}
+    end
+
     test "run function that returns nil produces empty JSON", %{tmp_dir: dir} do
       Application.put_env(:hl7toagent, :project_dir, dir)
 
