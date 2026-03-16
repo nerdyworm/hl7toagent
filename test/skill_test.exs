@@ -98,6 +98,126 @@ defmodule Hl7toagent.Channel.SkillTest do
     end
   end
 
+  describe "load_skill!/1 error handling" do
+    test "parse error raises on invalid Lua syntax", %{tmp_dir: dir} do
+      path = write_skill(dir, "bad_syntax.lua", """
+      return {{{
+      """)
+
+      assert_raise Lua.CompilerException, fn ->
+        Skill.load_skill!(path)
+      end
+    end
+
+    test "missing file raises", %{tmp_dir: dir} do
+      assert_raise File.Error, fn ->
+        Skill.load_skill!(Path.join(dir, "nonexistent.lua"))
+      end
+    end
+
+    test "skill missing name field raises validation error", %{tmp_dir: dir} do
+      path = write_skill(dir, "no_name.lua", """
+      return {
+        description = "no name",
+        run = function(params) return {} end
+      }
+      """)
+
+      # ReqLLM.Tool validates name is required
+      assert_raise ReqLLM.Error.Validation.Error, fn ->
+        Skill.load_skill!(path)
+      end
+    end
+
+    test "skill missing run field loads as tool kind", %{tmp_dir: dir} do
+      path = write_skill(dir, "no_run.lua", """
+      return {
+        name = "no_run",
+        description = "has no run function"
+      }
+      """)
+
+      # No soul → kind is :tool, but run is nil. load_skill! succeeds
+      # because it just wraps a callback — the error surfaces at execute time.
+      skill = Skill.load_skill!(path)
+      assert skill.kind == :tool
+      assert skill.name == "no_run"
+    end
+
+    test "skill returning non-table raises", %{tmp_dir: dir} do
+      path = write_skill(dir, "returns_string.lua", """
+      return "not a table"
+      """)
+
+      # Lua.call_function! on rawget expects a table — raises RuntimeException
+      assert_raise Lua.RuntimeException, fn ->
+        Skill.load_skill!(path)
+      end
+    end
+
+    test "empty file raises", %{tmp_dir: dir} do
+      path = write_skill(dir, "empty.lua", "")
+
+      assert_raise MatchError, fn ->
+        Skill.load_skill!(path)
+      end
+    end
+  end
+
+  describe "execute/2 error handling" do
+    test "parse error in skill file returns JSON error", %{tmp_dir: dir} do
+      Application.put_env(:hl7toagent, :project_dir, dir)
+
+      path = write_skill(dir, "bad_parse.lua", """
+      return {{{
+      """)
+
+      {:ok, json} = Skill.execute(path, %{message: "test"})
+      result = Jason.decode!(json)
+      assert Map.has_key?(result, "error")
+    end
+
+    test "missing file returns JSON error", %{tmp_dir: dir} do
+      Application.put_env(:hl7toagent, :project_dir, dir)
+
+      {:ok, json} = Skill.execute(Path.join(dir, "gone.lua"), %{message: "test"})
+      result = Jason.decode!(json)
+      assert result["error"] =~ "no such file"
+    end
+
+    test "skill with no run function returns JSON error", %{tmp_dir: dir} do
+      Application.put_env(:hl7toagent, :project_dir, dir)
+
+      path = write_skill(dir, "no_run_exec.lua", """
+      return {
+        name = "no_run",
+        description = "missing run"
+      }
+      """)
+
+      {:ok, json} = Skill.execute(path, %{message: "test"})
+      assert json =~ "error"
+    end
+
+    test "run function that returns nil produces empty JSON", %{tmp_dir: dir} do
+      Application.put_env(:hl7toagent, :project_dir, dir)
+
+      path = write_skill(dir, "nil_return.lua", """
+      return {
+        name = "nil_return",
+        description = "returns nothing",
+        run = function(params)
+          -- no return
+        end
+      }
+      """)
+
+      {:ok, json} = Skill.execute(path, %{message: "test"})
+      result = Jason.decode!(json)
+      assert result == %{}
+    end
+  end
+
   describe "execute/2 tool execution" do
     test "executes a simple Lua skill and returns JSON", %{tmp_dir: dir} do
       Application.put_env(:hl7toagent, :project_dir, dir)
