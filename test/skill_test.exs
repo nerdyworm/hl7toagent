@@ -164,8 +164,8 @@ defmodule Hl7toagent.Channel.SkillTest do
     end
   end
 
-  describe "execute/2 error handling" do
-    test "parse error in skill file returns JSON error", %{tmp_dir: dir} do
+  describe "execute/2 error messages" do
+    test "parse error includes filename and line number", %{tmp_dir: dir} do
       Application.put_env(:hl7toagent, :project_dir, dir)
 
       path = write_skill(dir, "bad_parse.lua", """
@@ -174,21 +174,103 @@ defmodule Hl7toagent.Channel.SkillTest do
 
       {:ok, json} = Skill.execute(path, %{message: "test"})
       result = Jason.decode!(json)
-      assert Map.has_key?(result, "error")
+      assert result["error"] =~ "bad_parse.lua"
+      assert result["error"] =~ "syntax error"
     end
 
-    test "missing file returns JSON error", %{tmp_dir: dir} do
+    test "parse error on later line includes correct line number", %{tmp_dir: dir} do
+      Application.put_env(:hl7toagent, :project_dir, dir)
+
+      path = write_skill(dir, "late_parse.lua", """
+      return {
+        name = "x",
+        description = "x",
+        run = function(params)
+          local x = {
+          return x
+        end
+      }
+      """)
+
+      {:ok, json} = Skill.execute(path, %{message: "test"})
+      result = Jason.decode!(json)
+      assert result["error"] =~ "late_parse.lua"
+      assert result["error"] =~ "line 6"
+    end
+
+    test "runtime error() shows the message clearly", %{tmp_dir: dir} do
+      Application.put_env(:hl7toagent, :project_dir, dir)
+
+      path = write_skill(dir, "runtime_err.lua", """
+      return {
+        name = "rt", description = "x",
+        run = function(params)
+          error("patient ID is missing")
+        end
+      }
+      """)
+
+      {:ok, json} = Skill.execute(path, %{message: "test"})
+      result = Jason.decode!(json)
+      assert result["error"] =~ "runtime_err.lua"
+      assert result["error"] =~ "patient ID is missing"
+      # Should NOT contain raw Erlang tuple syntax
+      refute result["error"] =~ ":error_call"
+    end
+
+    test "undefined function names the function", %{tmp_dir: dir} do
+      Application.put_env(:hl7toagent, :project_dir, dir)
+
+      path = write_skill(dir, "undef.lua", """
+      return {
+        name = "uf", description = "x",
+        run = function(params)
+          return do_something(params.message)
+        end
+      }
+      """)
+
+      {:ok, json} = Skill.execute(path, %{message: "test"})
+      result = Jason.decode!(json)
+      assert result["error"] =~ "undef.lua"
+      # Should say something about calling a nil value, not "undefined function: nil"
+      assert result["error"] =~ ~r/nil|not a function/i
+    end
+
+    test "nil field access explains what happened", %{tmp_dir: dir} do
+      Application.put_env(:hl7toagent, :project_dir, dir)
+
+      path = write_skill(dir, "nil_index.lua", """
+      return {
+        name = "ni", description = "x",
+        run = function(params)
+          local t = nil
+          return { result = t.field }
+        end
+      }
+      """)
+
+      {:ok, json} = Skill.execute(path, %{message: "test"})
+      result = Jason.decode!(json)
+      assert result["error"] =~ "nil_index.lua"
+      assert result["error"] =~ "field"
+      # Should NOT contain raw Erlang tuple syntax
+      refute result["error"] =~ ":illegal_index"
+    end
+
+    test "missing file includes filename", %{tmp_dir: dir} do
       Application.put_env(:hl7toagent, :project_dir, dir)
 
       {:ok, json} = Skill.execute(Path.join(dir, "gone.lua"), %{message: "test"})
       result = Jason.decode!(json)
-      assert result["error"] =~ "no such file"
+      assert result["error"] =~ "gone.lua"
+      assert result["error"] =~ ~r/not found|no such file/i
     end
 
-    test "skill with no run function returns JSON error", %{tmp_dir: dir} do
+    test "skill with no run function gives clear message", %{tmp_dir: dir} do
       Application.put_env(:hl7toagent, :project_dir, dir)
 
-      path = write_skill(dir, "no_run_exec.lua", """
+      path = write_skill(dir, "no_run.lua", """
       return {
         name = "no_run",
         description = "missing run"
@@ -196,7 +278,8 @@ defmodule Hl7toagent.Channel.SkillTest do
       """)
 
       {:ok, json} = Skill.execute(path, %{message: "test"})
-      assert json =~ "error"
+      result = Jason.decode!(json)
+      assert result["error"] =~ "no_run.lua"
     end
 
     test "run function that returns nil produces empty JSON", %{tmp_dir: dir} do

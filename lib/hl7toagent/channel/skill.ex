@@ -144,6 +144,7 @@ defmodule Hl7toagent.Channel.Skill do
   end
 
   def execute(path, params) do
+    skill_name = Path.basename(path)
     project_dir = Application.get_env(:hl7toagent, :project_dir, File.cwd!())
     sandbox_dir = project_dir
 
@@ -159,36 +160,29 @@ defmodule Hl7toagent.Channel.Skill do
 
     {params_table, lua} = Lua.encode!(lua, stringify_keys(params))
 
-    {result, lua} =
-      case Lua.call_function(lua, run_ref, [params_table]) do
-        {:ok, result, lua} ->
-          {result, lua}
+    case Lua.call_function(lua, run_ref, [params_table]) do
+      {:ok, result, lua} ->
+        decoded =
+          case result do
+            [{:tref, _} = tref] -> deep_decode(lua, tref)
+            [val] when is_list(val) -> Lua.Table.deep_cast(val)
+            [val] -> val
+            [] -> nil
+          end
 
-        {:error, {:undefined_function, func}, lua} ->
-          Logger.error("Lua undefined function: #{inspect(func)} in skill #{path}")
-          {[Jason.encode!(%{error: "undefined function: #{inspect(func)}"})], lua}
+        {:ok, Jason.encode!(decoded || %{})}
 
-        {:error, reason, lua} ->
-          Logger.error("Lua error in skill #{path}: #{inspect(reason)}")
-          {[Jason.encode!(%{error: inspect(reason)})], lua}
-      end
+      {:error, {:undefined_function, _func}, _lua} ->
+        skill_error(skill_name, "attempted to call a nil value (not a function)")
 
-    decoded =
-      case result do
-        [{:tref, _} = tref] -> deep_decode(lua, tref)
-        [val] when is_list(val) -> Lua.Table.deep_cast(val)
-        [val] -> val
-        [] -> nil
-      end
-
-    {:ok, Jason.encode!(decoded || %{})}
+      {:error, reason, _lua} ->
+        skill_error(skill_name, format_lua_reason(reason))
+    end
   rescue
     e ->
-      Logger.error(
-        "Skill execution error: #{Exception.message(e)}\n#{Exception.format_stacktrace(__STACKTRACE__)}"
-      )
-
-      {:ok, Jason.encode!(%{error: Exception.message(e)})}
+      msg = format_skill_error(Path.basename(path), format_exception(e))
+      Logger.error(msg)
+      {:ok, Jason.encode!(%{error: msg})}
   end
 
   defp deep_decode(lua, {:tref, _} = tref) do
@@ -206,4 +200,42 @@ defmodule Hl7toagent.Channel.Skill do
       {k, v} -> {k, v}
     end)
   end
+
+  defp skill_error(skill_name, detail) do
+    msg = "Error in #{skill_name}: #{detail}"
+    Logger.error(msg)
+    {:ok, Jason.encode!(%{error: msg})}
+  end
+
+  defp format_skill_error(skill_name, message) do
+    "Error in #{skill_name}: #{message}"
+  end
+
+  defp format_lua_reason({:error_call, [msg]}) when is_binary(msg), do: msg
+  defp format_lua_reason({:error_call, [msg | _]}), do: inspect(msg)
+  defp format_lua_reason({:illegal_index, nil, field}), do: "attempted to index a nil value (field '#{field}')"
+  defp format_lua_reason({:illegal_index, val, field}), do: "attempted to index a #{lua_type(val)} value (field '#{field}')"
+  defp format_lua_reason({:badarg, op, args}), do: "bad argument to '#{op}' (#{inspect(args)})"
+  defp format_lua_reason(reason), do: inspect(reason)
+
+  defp lua_type(val) when is_number(val), do: "number"
+  defp lua_type(val) when is_binary(val), do: "string"
+  defp lua_type(val) when is_boolean(val), do: "boolean"
+  defp lua_type(nil), do: "nil"
+  defp lua_type(_), do: "value"
+
+  defp format_exception(%Lua.CompilerException{} = e) do
+    msg = Exception.message(e)
+    # Extract "Line N: ..." from the compiler message
+    case Regex.run(~r/Line (\d+): (.+)/s, msg) do
+      [_, line, detail] -> "syntax error on line #{line}: #{String.trim(detail)}"
+      _ -> "syntax error: #{msg}"
+    end
+  end
+
+  defp format_exception(%File.Error{} = e) do
+    "file not found: #{e.path}"
+  end
+
+  defp format_exception(e), do: Exception.message(e)
 end
