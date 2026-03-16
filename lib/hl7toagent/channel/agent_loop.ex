@@ -21,23 +21,26 @@ defmodule Hl7toagent.Channel.AgentLoop do
 
     Process.put(:hl7toagent_channel, label)
 
+    generate_fn = Keyword.get(opts, :generate_fn, &ReqLLM.generate_text/3)
+
     context =
       case messages do
         %ReqLLM.Context{} -> messages
         msgs when is_list(msgs) -> ReqLLM.Context.new(msgs)
       end
 
-    tool_loop(context, tools, 1, model, max_rounds, label)
+    tool_loop(context, tools, 1, model, max_rounds, label, generate_fn)
   end
 
-  defp tool_loop(context, _tools, round, _model, max_rounds, _label) when round > max_rounds do
+  defp tool_loop(context, _tools, round, _model, max_rounds, _label, _generate_fn)
+       when round > max_rounds do
     {:ok, "Max tool rounds reached", context}
   end
 
-  defp tool_loop(context, tools, round, model, max_rounds, label) do
+  defp tool_loop(context, tools, round, model, max_rounds, label, generate_fn) do
     Logger.info("[#{label}] LLM call round #{round} → #{model} (#{length(tools)} tools)")
 
-    case ReqLLM.generate_text(model, context, tools: tools, on_unsupported: :ignore) do
+    case generate_fn.(model, context, tools: tools, on_unsupported: :ignore) do
       {:ok, response} ->
         log_thinking(label, round, response)
         log_usage(label, round, response)
@@ -78,7 +81,7 @@ defmodule Hl7toagent.Channel.AgentLoop do
               ReqLLM.Context.append(ctx, ReqLLM.Context.tool_result(call.id, call_name, result))
             end)
 
-          tool_loop(updated_context, tools, round + 1, model, max_rounds, label)
+          tool_loop(updated_context, tools, round + 1, model, max_rounds, label, generate_fn)
         end
 
       {:error, reason} ->
