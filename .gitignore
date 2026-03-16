@@ -32,6 +32,9 @@ hl7toagent-*.tar
 /sandbox/
 /archive/
 /processing/
+examples/*/archive/
+examples/*/processing/
+examples/*/logs/
 *.db
 *.db-shm
 *.db-wal
