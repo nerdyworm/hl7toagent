@@ -6,6 +6,28 @@ This started as a vibe-coded idea: what if you replaced the hundreds of lines of
 
 It's an experiment in trading deterministic integration code for readable intent. The soul file is something a clinician could review. The skills are tiny Lua scripts that give the agent hands. The whole thing is held together by Elixir supervision trees and an unhealthy amount of optimism.
 
+## Quick start
+
+```bash
+mix deps.get
+export OPENAI_API_KEY=sk-...
+
+# Start against ./config.lua
+mix run --no-halt
+
+# Or point at a separate project directory
+HL7TOAGENT_PROJECT_DIR=./my-project mix run --no-halt
+```
+
+Or build the binary and use:
+
+```bash
+hl7toagent init ./my-project
+hl7toagent start ./my-project
+```
+
+`OPENAI_API_KEY` is required for both `start` and `init`.
+
 ## How it works
 
 ```
@@ -19,7 +41,7 @@ It's an experiment in trading deterministic integration code for readable intent
 1. A **source** receives data — an MLLP HL7 feed, an HTTP POST, a new file in a directory, or an email via IMAP.
 2. The raw data is handed to the channel's **agent loop**, which calls an LLM with the channel's **soul** (a markdown system prompt) and the incoming message.
 3. The LLM decides which **skills** to call — Lua scripts that can hit webhooks, write files, translate formats, send emails, or anything else you wire up.
-4. The agent loops until the work is done (up to 20 tool rounds), then returns a final response.
+4. The agent loops until the work is done (up to 20 tool rounds), stores the conversation in `threads.db`, then returns a final response.
 
 ## Examples
 
@@ -324,7 +346,8 @@ channel("adt_router", {
 channel("api", {
     source = http({ port = 4000, path = "/hl7" }),
     soul = "souls/router.md",
-    skills = { "skills/notice.lua", "skills/webhook.lua" }
+    skills = { "skills/notice.lua", "skills/webhook.lua" },
+    model = "openai:gpt-5-mini"
 })
 
 channel("lab_inbox", {
@@ -336,14 +359,18 @@ channel("lab_inbox", {
 
 Config is Lua, not YAML — you get real conditionals, env vars via `env()`, loops, and string manipulation at config time.
 
+Channels also support an optional `model` field if you want to override the default LLM for a specific agent.
+
 ### Sources
 
 | Source | Description | Config |
 |---|---|---|
 | `mllp` | Listens for HL7 v2 messages over the MLLP protocol. Returns proper HL7 ACK/NAK. | `port` |
-| `http` | Accepts POST requests with raw message bodies. Returns JSON responses. | `port`, `path` |
-| `file_watcher` | Monitors a directory for new/modified files matching a glob pattern. | `dir`, `pattern` |
-| `imap` | Polls an IMAP mailbox for new emails. Supports search filters and mark-as-read. | `host`, `port`, `username`, `password`, `mailbox`, `poll_interval`, `search` |
+| `http` | Accepts `POST` requests, stages the request body into `processing/`, and returns JSON. Also exposes `GET /health`. | `port`, `path` |
+| `file_watcher` | Monitors a directory for new/modified files matching a glob pattern. Optional reply-routing mode can route email-like replies back to the originating channel thread. | `dir`, `pattern`, `replies` |
+| `imap` | Polls an IMAP mailbox for new emails. Supports search filters, SSL, and mark-as-read. | `host`, `port`, `username`, `password`, `mailbox`, `ssl`, `poll_interval`, `mark_read`, `search` |
+
+HTTP sources can continue an existing thread by passing `X-Thread-Id` / `X-Thread-Ref` headers or `thread_id` / `thread_ref` fields in a JSON request body.
 
 ### Souls
 
@@ -373,7 +400,7 @@ return {
 
 Skills have access to built-in Lua APIs:
 - `http.get(url, opts)` / `http.post(url, opts)` / `http.put(url, opts)` / `http.delete(url, opts)` — make HTTP requests
-- `file.write(filename, content)` / `file.read(filename)` / `file.delete(filename)` / `file.list(pattern)` — sandboxed file operations
+- `file.write(filename, content)` / `file.read(filename)` / `file.append(filename, content)` / `file.move(src, dest)` / `file.delete(filename)` / `file.list(path)` — sandboxed file operations
 - `email.send({ to, subject, body })` — send email (requires `smtp()` in config)
 
 #### Sub-agent skills
@@ -403,7 +430,7 @@ cron("lab_poller", {
 })
 ```
 
-If the script's `run()` returns data, it gets sent to the target channel as a message. Return `nil` to skip.
+If the script's `run()` returns data, it gets sent to the target channel as a message. Return `nil` to skip. A cron script can also return a list of messages to forward multiple payloads in one tick.
 
 ### Email threading
 
@@ -451,6 +478,8 @@ mix run --no-halt
 mix test
 ```
 
+`mix run --no-halt` uses `./config.lua` by default. Set `HL7TOAGENT_PROJECT_DIR=/path/to/project` to run a different project without changing directories.
+
 ## Building the binary
 
 hl7toagent uses [Burrito](https://github.com/burrito-elixir/burrito) to produce standalone binaries. No Erlang or Elixir installation required on the target machine.
@@ -481,6 +510,6 @@ archive/YYYY/MM/DD/     # Processed files (auto-created)
 
 ## Where data goes
 
-hl7toagent is stateless between messages. Each incoming message gets a fresh agent loop — no conversation history unless you're using threads. What persists is whatever the skills write to the outside world: webhook calls, files, emails. The `threads.db` SQLite database tracks email conversation threads for reply continuity.
+Each incoming message gets a fresh agent loop, but the message history is persisted in `threads.db` so channels can continue prior conversations when they receive a `thread_id` or `thread_ref`. What persists outside that is whatever the skills write to the world: webhook calls, files, emails, and logs.
 
 If you need durable storage, that's what skills are for — write a skill that inserts into a database, pushes to a queue, or calls an API. The agent decides when to use it based on the soul.
